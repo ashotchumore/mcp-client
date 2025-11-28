@@ -1,10 +1,58 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
-import { Send, Plus, MessageSquare, Trash2, Menu, X } from 'lucide-react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import Link from 'next/link';
+import { Send, Plus, MessageSquare, Trash2, Menu, X, Server, Circle, ImagePlus, Loader2 } from 'lucide-react';
 import { Streamdown } from 'streamdown';
 import { useSessions, useMessages, UISession, UIMessage } from '@/lib/hooks/useChat';
 import { migrateLocalStorageToSupabase } from '@/lib/migration';
+import { useMCP } from '@/lib/mcp/mcp-context';
+import { ToolCallsList } from '@/components/chat/tool-call-card';
+import type { ToolCallInfo, ToolCallStartEvent, ToolCallResultEvent } from '@/lib/mcp/types';
+
+// 이미지 업로드 API 호출
+async function uploadImageToStorage(
+  base64Data: string,
+  sessionId: string,
+  messageId: string,
+  options?: { filename?: string; mimeType?: string }
+): Promise<{ publicUrl: string } | null> {
+  try {
+    const response = await fetch('/api/upload/image', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        base64Data,
+        sessionId,
+        messageId,
+        filename: options?.filename,
+        mimeType: options?.mimeType,
+      }),
+    });
+
+    if (!response.ok) {
+      console.error('Upload failed:', response.statusText);
+      return null;
+    }
+
+    const result = await response.json();
+    if (result.success) {
+      return { publicUrl: result.publicUrl };
+    }
+    return null;
+  } catch (error) {
+    console.error('Upload error:', error);
+    return null;
+  }
+}
+
+// 업로드 대기 중인 이미지
+interface PendingImage {
+  file: File;
+  previewUrl: string;
+  base64: string;
+  mimeType: string;
+}
 
 function generateSessionTitle(firstMessage: string): string {
   const maxLength = 50;
@@ -80,15 +128,32 @@ function groupSessionsByDate(sessions: UISession[]): GroupedSessions[] {
   return result;
 }
 
+// 현재 응답에 대한 도구 호출 상태
+interface CurrentResponseState {
+  toolCalls: ToolCallInfo[];
+  textContent: string;
+}
+
 export default function Home() {
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [migrationDone, setMigrationDone] = useState(false);
+  const [currentResponse, setCurrentResponse] = useState<CurrentResponseState>({
+    toolCalls: [],
+    textContent: '',
+  });
+  const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
+  const [imageUploading, setImageUploading] = useState(false);
+  // 세션 중 보낸 메시지의 이미지를 추적 (메시지 인덱스 -> 이미지 URL 배열)
+  const [sentMessageImages, setSentMessageImages] = useState<Map<number, string[]>>(new Map());
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const currentSessionIdRef = useRef<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const { connectedCount } = useMCP();
 
   const {
     sessions,
@@ -102,7 +167,6 @@ export default function Home() {
 
   const {
     messages,
-    setMessages,
     loading: messagesLoading,
     addMessage,
     updateLastMessage,
@@ -136,10 +200,10 @@ export default function Home() {
     currentSessionIdRef.current = currentSessionId;
   }, [currentSessionId]);
 
-  // Scroll to bottom when messages change
+  // Scroll to bottom when messages or current response change
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages, currentResponse]);
 
   const handleCreateNewSession = async () => {
     const newSession = await createSession('새 대화');
@@ -147,6 +211,8 @@ export default function Home() {
       setCurrentSessionId(newSession.id);
       setInput('');
       setSidebarOpen(false);
+      setSentMessageImages(new Map()); // 새 세션 시 이미지 추적 초기화
+      setPendingImages([]); // 대기 중인 이미지도 초기화
     }
   };
 
@@ -157,6 +223,9 @@ export default function Home() {
     }
     setCurrentSessionId(sessionId);
     setSidebarOpen(false);
+    setCurrentResponse({ toolCalls: [], textContent: '' });
+    setSentMessageImages(new Map()); // 세션 변경 시 이미지 추적 초기화
+    setPendingImages([]); // 대기 중인 이미지도 초기화
   };
 
   const handleDeleteSession = async (sessionId: string, e: React.MouseEvent) => {
@@ -176,45 +245,191 @@ export default function Home() {
     }
   };
 
+  // SSE 이벤트 파싱
+  const parseSSEEvent = useCallback((line: string): { event: string; data: unknown } | null => {
+    if (!line.startsWith('event:')) return null;
+    
+    const eventMatch = line.match(/^event:\s*(\w+)/);
+    const dataMatch = line.match(/data:\s*(.+)$/m);
+    
+    if (eventMatch && dataMatch) {
+      try {
+        return {
+          event: eventMatch[1],
+          data: JSON.parse(dataMatch[1]),
+        };
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }, []);
+
+  // 이미지 파일 선택 핸들러
+  const handleImageSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    setImageUploading(true);
+    
+    const newImages: PendingImage[] = [];
+    
+    for (const file of Array.from(files)) {
+      // 이미지 파일만 허용
+      if (!file.type.startsWith('image/')) continue;
+      
+      // 10MB 제한
+      if (file.size > 10 * 1024 * 1024) {
+        alert(`파일 "${file.name}"이(가) 너무 큽니다. 10MB 이하만 지원됩니다.`);
+        continue;
+      }
+
+      try {
+        // Base64로 변환
+        const base64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+
+        newImages.push({
+          file,
+          previewUrl: URL.createObjectURL(file),
+          base64,
+          mimeType: file.type,
+        });
+      } catch (error) {
+        console.error('Failed to read file:', error);
+      }
+    }
+
+    setPendingImages((prev) => [...prev, ...newImages]);
+    setImageUploading(false);
+    
+    // 파일 입력 초기화
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  }, []);
+
+  // 대기 중인 이미지 제거
+  const removePendingImage = useCallback((index: number) => {
+    setPendingImages((prev) => {
+      const newImages = [...prev];
+      // 미리보기 URL 해제
+      URL.revokeObjectURL(newImages[index].previewUrl);
+      newImages.splice(index, 1);
+      return newImages;
+    });
+  }, []);
+
+  // 이미지 업로드 버튼 클릭
+  const handleImageButtonClick = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || isLoading) return;
+    // 텍스트나 이미지 중 하나라도 있어야 전송 가능
+    if ((!input.trim() && pendingImages.length === 0) || isLoading) return;
 
     let sessionId = currentSessionId;
     const userInput = input.trim();
+    const imagesToSend = [...pendingImages];
 
     // Create new session if none exists
     if (!sessionId) {
-      const newSession = await createSession(generateSessionTitle(userInput));
+      const title = userInput || (imagesToSend.length > 0 ? '이미지 분석' : '새 대화');
+      const newSession = await createSession(generateSessionTitle(title));
       if (!newSession) return;
       sessionId = newSession.id;
       setCurrentSessionId(sessionId);
-    } else if (messages.length === 0) {
+    } else if (messages.length === 0 && userInput) {
       // Update title from first message
       await updateSessionTitle(sessionId, generateSessionTitle(userInput));
     }
 
-    // Add user message to DB
-    const userMessage = await addMessage('user', userInput);
+    // Add user message to DB (이미지 정보는 별도 저장)
+    const userMessage = await addMessage('user', userInput || '[이미지]');
     if (!userMessage) return;
+    
+    const userMessageId = userMessage.id;
 
+    // 입력 초기화
     setInput('');
+    setPendingImages([]);
     setIsLoading(true);
+    setCurrentResponse({ toolCalls: [], textContent: '' });
+
+    // 미리보기 URL 해제
+    imagesToSend.forEach(img => URL.revokeObjectURL(img.previewUrl));
 
     // Create abort controller for cancellation
     abortControllerRef.current = new AbortController();
 
+    // 이미지를 Supabase Storage에 업로드
+    const uploadedImageUrls: string[] = [];
+    if (imagesToSend.length > 0 && userMessageId) {
+      for (let i = 0; i < imagesToSend.length; i++) {
+        const img = imagesToSend[i];
+        try {
+          const result = await uploadImageToStorage(
+            img.base64,
+            sessionId,
+            userMessageId,
+            {
+              filename: `user_image_${i}_${Date.now()}.${img.mimeType.split('/')[1] || 'png'}`,
+              mimeType: img.mimeType,
+            }
+          );
+          if (result) {
+            uploadedImageUrls.push(result.publicUrl);
+          }
+        } catch (error) {
+          console.error('Failed to upload image:', error);
+          // 업로드 실패해도 Base64로 전송은 계속 진행
+        }
+      }
+    }
+
+    // 보낸 이미지를 추적 (UI 표시용 - Storage URL 사용)
+    if (imagesToSend.length > 0) {
+      const messageIndex = messages.length; // 새 사용자 메시지 인덱스
+      setSentMessageImages(prev => {
+        const newMap = new Map(prev);
+        // Storage URL이 있으면 사용, 없으면 Base64 사용
+        const imageUrls = uploadedImageUrls.length > 0 
+          ? uploadedImageUrls 
+          : imagesToSend.map(img => img.base64);
+        newMap.set(messageIndex, imageUrls);
+        return newMap;
+      });
+    }
+
     try {
-      // Add empty assistant message for streaming
-      const newMessages: UIMessage[] = [...messages, { role: 'user', content: userInput }];
+      // Build message history with images for the last message
+      const newMessages: UIMessage[] = [
+        ...messages, 
+        { 
+          role: 'user', 
+          content: userInput,
+          images: imagesToSend.map(img => ({ url: img.base64, mimeType: img.mimeType })),
+        }
+      ];
       
-      // Pre-insert empty model message
-      await addMessage('model', '');
+      // Pre-insert empty model message and get its ID for image storage
+      const modelMessage = await addMessage('model', '');
+      const modelMessageId = modelMessage?.id;
       
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: newMessages }),
+        body: JSON.stringify({ 
+          messages: newMessages,
+          sessionId,          // 이미지 저장을 위한 세션 ID
+          messageId: modelMessageId,  // 이미지와 메시지 연결을 위한 메시지 ID
+        }),
         signal: abortControllerRef.current.signal,
       });
 
@@ -232,7 +447,9 @@ export default function Home() {
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
+      let buffer = '';
       let accumulatedText = '';
+      const toolCallsMap = new Map<string, ToolCallInfo>();
 
       while (true) {
         const { done, value } = await reader.read();
@@ -244,11 +461,79 @@ export default function Home() {
           return;
         }
 
-        const chunk = decoder.decode(value, { stream: true });
-        accumulatedText += chunk;
+        buffer += decoder.decode(value, { stream: true });
+        
+        // SSE 이벤트 파싱
+        const lines = buffer.split('\n\n');
+        buffer = lines.pop() || ''; // 마지막 불완전한 청크 보관
 
-        // Update the last assistant message with accumulated text
-        updateLastMessage(accumulatedText);
+        for (const chunk of lines) {
+          if (!chunk.trim()) continue;
+
+          const eventLine = chunk.split('\n').find(l => l.startsWith('event:'));
+          const dataLine = chunk.split('\n').find(l => l.startsWith('data:'));
+
+          if (eventLine && dataLine) {
+            const event = eventLine.replace('event:', '').trim();
+            let data: unknown;
+            try {
+              data = JSON.parse(dataLine.replace('data:', '').trim());
+            } catch {
+              continue;
+            }
+
+            switch (event) {
+              case 'text': {
+                const textData = data as { content: string };
+                accumulatedText = textData.content;
+                updateLastMessage(accumulatedText);
+                setCurrentResponse(prev => ({ ...prev, textContent: accumulatedText }));
+                break;
+              }
+              case 'tool_call_start': {
+                const startData = data as ToolCallStartEvent;
+                const toolCall: ToolCallInfo = {
+                  id: startData.id,
+                  serverId: startData.serverId,
+                  serverName: startData.serverName,
+                  name: startData.name,
+                  arguments: startData.arguments,
+                  status: 'executing',
+                  startedAt: Date.now(),
+                };
+                toolCallsMap.set(startData.id, toolCall);
+                setCurrentResponse(prev => ({
+                  ...prev,
+                  toolCalls: Array.from(toolCallsMap.values()),
+                }));
+                break;
+              }
+              case 'tool_call_result': {
+                const resultData = data as ToolCallResultEvent;
+                const existingCall = toolCallsMap.get(resultData.id);
+                if (existingCall) {
+                  existingCall.status = resultData.error ? 'error' : 'completed';
+                  existingCall.result = resultData.result;
+                  existingCall.error = resultData.error;
+                  existingCall.images = resultData.images;  // 이미지 URL 추가
+                  existingCall.completedAt = Date.now();
+                  toolCallsMap.set(resultData.id, existingCall);
+                  setCurrentResponse(prev => ({
+                    ...prev,
+                    toolCalls: Array.from(toolCallsMap.values()),
+                  }));
+                }
+                break;
+              }
+              case 'error': {
+                const errorData = data as { message: string };
+                throw new Error(errorData.message);
+              }
+              case 'done':
+                break;
+            }
+          }
+        }
       }
 
       // Save the final message content to DB
@@ -266,6 +551,7 @@ export default function Home() {
     } finally {
       setIsLoading(false);
       abortControllerRef.current = null;
+      // 도구 호출 상태는 유지 (표시용)
     }
   };
 
@@ -273,6 +559,7 @@ export default function Home() {
     if (!currentSessionId) return;
     if (confirm('이 대화의 모든 메시지를 삭제하시겠습니까?')) {
       await clearMessages();
+      setCurrentResponse({ toolCalls: [], textContent: '' });
     }
   };
 
@@ -391,14 +678,33 @@ export default function Home() {
                 {currentSession?.title || 'AI Chat'}
               </h1>
             </div>
-            {messages.length > 0 && (
-              <button
-                onClick={handleClear}
-                className="text-sm text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
+            <div className="flex items-center gap-4">
+              <Link
+                href="/mcp"
+                className="flex items-center gap-2 px-3 py-1.5 text-sm bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-lg transition-colors"
               >
-                채팅 삭제
-              </button>
-            )}
+                <Server className="w-4 h-4 text-gray-600 dark:text-gray-400" />
+                <span className="text-gray-700 dark:text-gray-300">MCP</span>
+                <div className="flex items-center gap-1">
+                  <Circle
+                    className={`w-2 h-2 ${
+                      connectedCount > 0 ? 'text-emerald-500 fill-emerald-500' : 'text-gray-400 fill-gray-400'
+                    }`}
+                  />
+                  <span className="text-xs text-gray-500 dark:text-gray-400">
+                    {connectedCount}
+                  </span>
+                </div>
+              </Link>
+              {messages.length > 0 && (
+                <button
+                  onClick={handleClear}
+                  className="text-sm text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
+                >
+                  채팅 삭제
+                </button>
+              )}
+            </div>
           </div>
         </header>
 
@@ -411,41 +717,88 @@ export default function Home() {
             </div>
           ) : messages.length === 0 ? (
             <div className="text-center text-gray-500 dark:text-gray-400 mt-12">
-              메시지를 입력하여 대화를 시작하세요.
+              <p>메시지를 입력하여 대화를 시작하세요.</p>
+              {connectedCount > 0 && (
+                <p className="text-sm mt-2 text-emerald-600 dark:text-emerald-400">
+                  {connectedCount}개의 MCP 서버가 연결되어 도구를 사용할 수 있습니다.
+                </p>
+              )}
             </div>
           ) : (
-            messages.map((message, index) => (
-              <div
-                key={index}
-                className={`flex ${
-                  message.role === 'user' ? 'justify-end' : 'justify-start'
-                }`}
-              >
+            <>
+              {messages.map((message, index) => (
                 <div
-                  className={`max-w-[80%] rounded-lg px-4 py-2 ${
-                    message.role === 'user'
-                      ? 'bg-blue-600 text-white'
-                      : 'bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 border border-gray-200 dark:border-gray-700'
+                  key={index}
+                  className={`flex ${
+                    message.role === 'user' ? 'justify-end' : 'justify-start'
                   }`}
                 >
-                  {message.role === 'user' ? (
-                    <div className="whitespace-pre-wrap break-words">
-                      {message.content}
-                    </div>
-                  ) : (
-                    <div className="break-words [&_*]:text-inherit">
-                      {message.content ? (
-                        <Streamdown parseIncompleteMarkdown={isLoading && index === messages.length - 1}>
-                          {message.content}
-                        </Streamdown>
-                      ) : (
-                        <span className="text-gray-500">...</span>
-                      )}
-                    </div>
-                  )}
+                  <div
+                    className={`max-w-[80%] rounded-lg px-4 py-2 ${
+                      message.role === 'user'
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 border border-gray-200 dark:border-gray-700'
+                    }`}
+                  >
+                    {message.role === 'user' ? (
+                      <div className="space-y-2">
+                        {/* 사용자가 보낸 이미지 표시 (DB에서 로드 또는 현재 세션에서 전송) */}
+                        {(message.images && message.images.length > 0) || sentMessageImages.get(index) ? (
+                          <div className="flex flex-wrap gap-2">
+                            {/* DB에서 로드된 이미지 */}
+                            {message.images?.map((img, imgIndex) => (
+                              <img
+                                key={`db-${imgIndex}`}
+                                src={img.url}
+                                alt={`Image ${imgIndex + 1}`}
+                                className="max-w-[200px] max-h-[200px] rounded-lg object-cover cursor-pointer hover:opacity-90 transition-opacity"
+                                onClick={() => window.open(img.url, '_blank')}
+                              />
+                            ))}
+                            {/* 현재 세션에서 전송된 이미지 (DB에 아직 없는 경우) */}
+                            {!message.images && sentMessageImages.get(index)?.map((imgUrl, imgIndex) => (
+                              <img
+                                key={`sent-${imgIndex}`}
+                                src={imgUrl}
+                                alt={`Sent image ${imgIndex + 1}`}
+                                className="max-w-[200px] max-h-[200px] rounded-lg object-cover cursor-pointer hover:opacity-90 transition-opacity"
+                                onClick={() => window.open(imgUrl, '_blank')}
+                              />
+                            ))}
+                          </div>
+                        ) : null}
+                        {/* 텍스트 내용 */}
+                        {message.content && message.content !== '[이미지]' && (
+                          <div className="whitespace-pre-wrap break-words">
+                            {message.content}
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="break-words">
+                        {/* 마지막 어시스턴트 메시지인 경우 도구 호출 표시 */}
+                        {index === messages.length - 1 && currentResponse.toolCalls.length > 0 && (
+                          <ToolCallsList toolCalls={currentResponse.toolCalls} />
+                        )}
+                        {message.content ? (
+                          <div className="[&_*]:text-inherit">
+                            <Streamdown parseIncompleteMarkdown={isLoading && index === messages.length - 1}>
+                              {message.content}
+                            </Streamdown>
+                          </div>
+                        ) : isLoading && index === messages.length - 1 ? (
+                          currentResponse.toolCalls.length === 0 && (
+                            <span className="text-gray-500">...</span>
+                          )
+                        ) : (
+                          <span className="text-gray-500">...</span>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))
+              ))}
+            </>
           )}
             <div ref={messagesEndRef} />
           </div>
@@ -454,7 +807,50 @@ export default function Home() {
         {/* Input Form */}
         <div className="border-t border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 px-4 py-4">
           <form onSubmit={handleSubmit} className="max-w-4xl mx-auto">
+            {/* 이미지 미리보기 */}
+            {pendingImages.length > 0 && (
+              <div className="flex flex-wrap gap-2 mb-3 p-2 bg-gray-100 dark:bg-gray-800 rounded-lg">
+                {pendingImages.map((img, index) => (
+                  <div key={index} className="relative group">
+                    <img
+                      src={img.previewUrl}
+                      alt={`Preview ${index + 1}`}
+                      className="w-20 h-20 object-cover rounded-lg border border-gray-300 dark:border-gray-600"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => removePendingImage(index)}
+                      className="absolute -top-2 -right-2 w-5 h-5 bg-red-500 text-white rounded-full flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity hover:bg-red-600"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            
             <div className="flex gap-2">
+              {/* 숨겨진 파일 입력 */}
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/png,image/jpeg,image/gif,image/webp"
+                multiple
+                onChange={handleImageSelect}
+                className="hidden"
+              />
+              
+              {/* 이미지 업로드 버튼 */}
+              <button
+                type="button"
+                onClick={handleImageButtonClick}
+                disabled={isLoading || imageUploading}
+                className="px-3 py-2 text-gray-600 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                title="이미지 업로드"
+              >
+                <ImagePlus className="w-5 h-5" />
+              </button>
+              
               <textarea
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
@@ -464,14 +860,18 @@ export default function Home() {
                     handleSubmit(e);
                   }
                 }}
-                placeholder="메시지를 입력하세요... (Shift+Enter로 줄바꿈)"
+                placeholder={
+                  connectedCount > 0
+                    ? `메시지를 입력하세요... (${connectedCount}개 MCP 서버 연결됨)`
+                    : '메시지를 입력하세요... (Shift+Enter로 줄바꿈)'
+                }
                 rows={1}
                 className="flex-1 resize-none rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-4 py-2 text-gray-900 dark:text-gray-100 placeholder-gray-500 dark:placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                 disabled={isLoading}
               />
               <button
                 type="submit"
-                disabled={!input.trim() || isLoading}
+                disabled={(!input.trim() && pendingImages.length === 0) || isLoading}
                 className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center justify-center"
               >
                 <Send className="w-5 h-5" />

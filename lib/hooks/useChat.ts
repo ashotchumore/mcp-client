@@ -2,11 +2,20 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { supabase, ChatSession, Message } from '../supabase';
+import { getImagePublicUrl } from '../image-storage';
+
+// 메시지 이미지 타입
+export interface MessageImage {
+  url: string;
+  mimeType: string;
+}
 
 // UI에서 사용하는 메시지 타입 (DB 타입과 분리)
 export interface UIMessage {
+  id?: string;  // DB에서 가져온 메시지의 경우 ID 포함
   role: 'user' | 'model';
   content: string;
+  images?: MessageImage[];  // 사용자가 업로드한 이미지 (Gemini 분석용)
 }
 
 // UI에서 사용하는 세션 타입 (updatedAt을 number로 변환)
@@ -26,6 +35,7 @@ function toUISession(session: ChatSession): UISession {
 
 function toUIMessage(message: Message): UIMessage {
   return {
+    id: message.id,
     role: message.role,
     content: message.content,
   };
@@ -149,14 +159,39 @@ export function useMessages(sessionId: string | null) {
 
     setLoading(true);
     try {
-      const { data, error } = await supabase
+      // 메시지와 연결된 이미지를 함께 조회
+      const { data: messagesData, error: messagesError } = await supabase
         .from('messages')
         .select('*')
         .eq('session_id', sessionId)
         .order('created_at', { ascending: true });
 
-      if (error) throw error;
-      setMessages((data || []).map(toUIMessage));
+      if (messagesError) throw messagesError;
+
+      // 각 메시지에 대해 이미지 조회
+      const messagesWithImages: UIMessage[] = await Promise.all(
+        (messagesData || []).map(async (message) => {
+          const { data: imageData } = await supabase
+            .from('message_images')
+            .select('storage_path, mime_type')
+            .eq('message_id', message.id)
+            .order('created_at', { ascending: true });
+
+          const images: MessageImage[] = (imageData || []).map((img) => ({
+            url: getImagePublicUrl(img.storage_path),
+            mimeType: img.mime_type || 'image/png',
+          }));
+
+          return {
+            id: message.id,
+            role: message.role,
+            content: message.content,
+            images: images.length > 0 ? images : undefined,
+          };
+        })
+      );
+
+      setMessages(messagesWithImages);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch messages');
     } finally {
